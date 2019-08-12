@@ -29,17 +29,10 @@
 #include <linux/time.h>
 #include <linux/vmalloc.h>
 #include <linux/aio.h>
-#include <linux/irq_work.h>
 #include "logger.h"
 
 #include <asm/ioctls.h>
 
-#ifdef CONFIG_AMAZON_METRICS_LOG
-#include <linux/metricslog.h>
-
-static int metrics_init;
-#define VITAL_ENTRY_MAX_PAYLOAD 512
-#endif
 
 static int s_fake_read;
 module_param_named(fake_read, s_fake_read, int, 0660);
@@ -71,55 +64,12 @@ struct logger_log {
 	struct miscdevice	misc;
 	wait_queue_head_t	wq;
 	struct list_head	readers;
-#ifdef CONFIG_AMAZON_KLOG_CONSOLE
-	union {
-		struct mutex		mutex;
-		struct semaphore	sem;
-	};
-	int is_mutex;
-#else
 	struct mutex		mutex;
-#endif
 	size_t			w_off;
 	size_t			head;
 	size_t			size;
 	struct list_head	logs;
 };
-
-#ifdef CONFIG_AMAZON_KLOG_CONSOLE
-#define logger_lock(log) \
-	do { \
-		if(log->is_mutex) \
-			mutex_lock(&log->mutex); \
-		else \
-			down(&log->sem); \
-	} while(0)
-
-#define logger_unlock(log) \
-	do { \
-		if(log->is_mutex) \
-			mutex_unlock(&log->mutex); \
-		else \
-			up(&log->sem); \
-	} while(0)
-
-#define init_logger_lock(log) \
-	do { \
-		if(log->is_mutex) \
-			mutex_init(&log->mutex); \
-		else \
-			sema_init(&log->sem, 1); \
-	} while(0)
-
-#else
-
-#define logger_lock(log) mutex_lock(&log->mutex)
-
-#define logger_unlock(log) mutex_unlock(&log->mutex);
-
-#define init_logger_lock(log) mutex_init(&log->mutex);
-
-#endif
 
 static LIST_HEAD(log_list);
 
@@ -674,21 +624,6 @@ static struct logger_log *get_log_from_minor(int minor)
 	return NULL;
 }
 
-/*
-#ifdef CONFIG_AMAZON_METRICS_LOG
-static struct logger_log *get_log_from_name(char* name)
-{
-    struct logger_log *log;
-    if (0 == name) {
-        return NULL;
-    }
-    list_for_each_entry(log, &log_list, logs)
-        if (0 == strcmp(log->misc.name, name))
-            return log;
-    return NULL;
-}
-#endif
-*/
 
 /*
  * logger_open - the log's open() file operation
@@ -985,9 +920,6 @@ static int __init create_log(char *log_name, int size)
 
 	init_waitqueue_head(&log->wq);
 	INIT_LIST_HEAD(&log->readers);
-#ifdef CONFIG_AMAZON_KLOG_CONSOLE
-	log->is_mutex = strncmp(log_name, LOGGER_LOG_KERNEL, strlen(LOGGER_LOG_KERNEL));
-#endif
 	init_logger_lock(log);
 	log->w_off = 0;
 	log->head = 0;
@@ -1017,459 +949,25 @@ out_free_buffer:
 	return ret;
 }
 
-#ifdef CONFIG_AMAZON_KLOG_CONSOLE
-#define KERNEL_DOMAIN  "Kernel"
-#define ANDROID_LOG_INFO   (4)
-
-struct kmsg_write_priv {
-	struct logger_log *log;
-	struct irq_work kmsg_write_work;
-};
-
-
-static struct logger_log *kmsg_log;
-
-#ifdef CONFIG_AMAZON_KLOG_CONSOLE_DEBUG
-static long long kmsg_delayed_count;
-static ssize_t kmsg_delayed_count_show(struct kobject *kobj,
-				  struct kobj_attribute *attr, char *buf)
-{
-	return sprintf(buf, "%lld\n", kmsg_delayed_count);
-}
-static struct kobj_attribute kmsg_delayed_count_attr =
-	__ATTR_RO(kmsg_delayed_count);
-
-static long long kmsg_failed_count;
-static ssize_t kmsg_failed_count_show(struct kobject *kobj,
-				  struct kobj_attribute *attr, char *buf)
-{
-	return sprintf(buf, "%lld\n", kmsg_failed_count);
-}
-static struct kobj_attribute kmsg_failed_count_attr =
-	__ATTR_RO(kmsg_failed_count);
-
-static long long kmsg_total_count;
-static ssize_t kmsg_total_count_show(struct kobject *kobj,
-				  struct kobj_attribute *attr, char *buf)
-{
-	return sprintf(buf, "%lld\n", kmsg_total_count);
-}
-static struct kobj_attribute kmsg_total_count_attr =
-	__ATTR_RO(kmsg_total_count);
-
-static struct attribute *kmsg_attrs[] = {
-	&kmsg_delayed_count_attr.attr,
-	&kmsg_total_count_attr.attr,
-	&kmsg_failed_count_attr.attr,
-	NULL
-};
-
-static struct attribute_group kmsg_attr_group = {
-	.name = "kmsg",
-	.attrs = kmsg_attrs,
-};
-#endif
-
-/* buffer for kernel log when it cannot get semphore */
-#define KERNEL_LOG_BUF_LEN (1 << CONFIG_LOG_BUF_SHIFT)
-static char kernel_log_buf[KERNEL_LOG_BUF_LEN] __aligned(8);
-static char *klog_buf = kernel_log_buf;
-static u32 klog_buf_len = KERNEL_LOG_BUF_LEN;
-static DEFINE_RAW_SPINLOCK(klog_buf_lock);
-/* index and sequence number of the first record stored in the buffer */
-static u64 log_first_seq;
-static u32 log_first_idx;
-/* index and sequence number of the next record to store in the buffer */
-static u64 log_next_seq;
-static u32 log_next_idx;
-
-/* get record by index; idx must point to valid msg */
-static struct logger_entry *log_from_idx(u32 idx)
-{
-	struct logger_entry *msg = (struct logger_entry *)(klog_buf + idx);
-
-	/*
-	 * A length == 0 record is the end of buffer marker. Wrap around and
-	 * read the message at the start of the buffer.
-	 */
-	if (!msg->len)
-		return (struct logger_entry *)klog_buf;
-	return msg;
-}
-
-/* get next record; idx must point to valid msg */
-static u32 log_next(u32 idx)
-{
-	struct logger_entry *msg = (struct logger_entry *)(klog_buf + idx);
-
-	/* length == 0 indicates the end of the buffer; wrap */
-	/*
-	 * A length == 0 record is the end of buffer marker. Wrap around and
-	 * read the message at the start of the buffer as *this* one, and
-	 * return the one after that.
-	 */
-	if (!msg->len) {
-		msg = (struct logger_entry *)klog_buf;
-		return msg->len;
-	}
-	return idx + msg->len;
-}
-
-/*
- * Check whether there is enough free space for the given message.
- *
- * The same values of first_idx and next_idx mean that the buffer
- * is either empty or full.
- *
- * If the buffer is empty, we must respect the position of the indexes.
- * They cannot be reset to the beginning of the buffer.
- */
-static int logbuf_has_space(u32 msg_size, bool empty)
-{
-	u32 free;
-
-	if (log_next_idx > log_first_idx || empty)
-		free = max(klog_buf_len - log_next_idx, log_first_idx);
-	else
-		free = log_first_idx - log_next_idx;
-
-	/*
-	 * We need space also for an empty header that signalizes wrapping
-	 * of the buffer.
-	 */
-	return free >= msg_size + sizeof(struct logger_entry);
-}
-
-static int log_make_free_space(u32 msg_size)
-{
-	while (log_first_seq < log_next_seq) {
-		if (logbuf_has_space(msg_size, false))
-			return 0;
-		/* drop old messages until we have enough contiguous space */
-		log_first_idx = log_next(log_first_idx);
-		log_first_seq++;
-	}
-
-	/* sequence numbers are equal, so the log buffer is empty */
-	if (logbuf_has_space(msg_size, true))
-		return 0;
-
-	return -ENOMEM;
-}
-
-/* insert record into the buffer, discard old ones, update heads */
-static int logger_kmsg_drain(struct logger_entry *header, const char *text, u16 text_len)
-{
-	unsigned long flags;
-	struct logger_entry *msg;
-	u16 payload_len = min_t(size_t, text_len, LOGGER_ENTRY_MAX_PAYLOAD);
-	u32 size = payload_len + sizeof(struct logger_entry);
-	raw_spin_lock_irqsave(&klog_buf_lock, flags);
-	/* if has no space */
-	if (log_make_free_space(size)) {
-		raw_spin_unlock_irqrestore(&klog_buf_lock, flags);
-		return 0;
-	}
-	if (log_next_idx + size + sizeof(struct logger_entry) > klog_buf_len) {
-		/*
-		 * This message + an additional empty header does not fit
-		 * at the end of the buffer. Add an empty header with len == 0
-		 * to signify a wrap around.
-		 */
-		memset(klog_buf + log_next_idx, 0, sizeof(struct logger_entry));
-		log_next_idx = 0;
-	}
-	/* fill message */
-	msg = (struct logger_entry *)(klog_buf + log_next_idx);
-	msg->pid = header->pid;
-	msg->tid = header->tid;
-	msg->sec = header->sec;
-	msg->nsec = header->nsec;
-	msg->len = size; /* contains header*/
-	memcpy(klog_buf + log_next_idx + sizeof(struct logger_entry), text, payload_len);
-	/* insert message */
-	log_next_idx += size;
-	log_next_seq++;
-	raw_spin_unlock_irqrestore(&klog_buf_lock, flags);
-
-	return payload_len;
-}
-
-static void logger_kmsg_write_delayed(struct logger_entry *log_msg)
-{
-	struct logger_log *log = kmsg_log;
-	struct logger_entry header;
-	unsigned long count = 3;
-	size_t total_len = 0;
-	struct iovec iov[3];
-	struct iovec *piov = &iov[0];
-	unsigned char log_level = ANDROID_LOG_INFO;
-
-	iov[0].iov_base = (unsigned char *)&log_level;
-	iov[0].iov_len  = 1;
-
-	iov[1].iov_base = (void *)KERNEL_DOMAIN;
-	iov[1].iov_len  = strlen(KERNEL_DOMAIN) + 1;
-
-	iov[2].iov_base = (void *)((char *)log_msg + sizeof(struct logger_entry));
-	iov[2].iov_len  = log_msg->len - sizeof(struct logger_entry);
-
-	while (count-- > 0) {
-		total_len += iov[count].iov_len;
-	}
-
-	header.pid = log_msg->pid;
-	header.tid = log_msg->tid;
-	header.sec = log_msg->sec;
-	header.nsec = log_msg->nsec;
-	header.len = min_t(size_t, total_len, LOGGER_ENTRY_MAX_PAYLOAD);
-
-	/* null writes succeed, return zero */
-	if (unlikely(!header.len))
-		return;
-
-	/*
-	 * Fix up any readers, pulling them forward to the first readable
-	 * entry after (what will be) the new write offset. We do this now
-	 * because if we partially fail, we can end up with clobbered log
-	 * entries that encroach on readable buffer.
-	 */
-	fix_up_readers(log, sizeof(struct logger_entry) + header.len);
-
-	do_write_log(log, &header, sizeof(struct logger_entry));
-
-	total_len = 0;
-
-	count = 3;
-	while (count-- > 0) {
-		size_t len;
-
-		/* figure out how much of this vector we can keep */
-		len = min_t(size_t, piov->iov_len, header.len - total_len);
-
-		/* write out this segment's payload */
-		do_write_log(log, piov->iov_base, len);
-
-		piov++;
-		total_len += len;
-	}
-}
-
-static void logger_kmsg_drain_delayed(struct logger_log *log)
-{
-	unsigned long flags;
-	static char kbuffer[sizeof(struct logger_log) + LOGGER_ENTRY_MAX_PAYLOAD];
-	struct logger_entry *msg;
-	for (;;) {
-		raw_spin_lock_irqsave(&klog_buf_lock, flags);
-		if (log_first_seq == log_next_seq) {
-			raw_spin_unlock_irqrestore(&klog_buf_lock, flags);
-			break;
-		}
-
-		msg = log_from_idx(log_first_idx);
-
-		log_first_idx = log_next(log_first_idx);
-		log_first_seq++;
-
-		memcpy(kbuffer, msg, msg->len);
-		raw_spin_unlock_irqrestore(&klog_buf_lock, flags);
-
-		logger_kmsg_write_delayed((struct logger_entry *)kbuffer);
-	}
-}
-
-static void kmsg_write_work_func(struct irq_work *irq_work)
-{
-	struct kmsg_write_priv *priv = container_of(irq_work, struct kmsg_write_priv,
-							kmsg_write_work);
-	/* wake up any blocked readers */
-	wake_up_interruptible(&priv->log->wq);
-}
-
-static DEFINE_PER_CPU(struct kmsg_write_priv, priv_data) = {
-	.kmsg_write_work = {
-		.func = kmsg_write_work_func,
-		.flags = IRQ_WORK_LAZY,
-	},
-};
-
-void logger_kmsg_write(const char *log_msg, size_t len)
-{
-	static struct logger_log *log;
-	struct logger_entry header;
-	struct timespec now;
-	unsigned long count = 3;
-	size_t total_len = 0;
-	struct iovec iov[3];
-	struct iovec *piov = &iov[0];
-	unsigned char log_level = ANDROID_LOG_INFO;
-
-	/* get the main log handler */
-	if (!kmsg_log) {
-		list_for_each_entry(log, &log_list, logs)
-			if (0 == strcmp(log->misc.name, LOGGER_LOG_KERNEL)) {
-				kmsg_log = log;
-				break;
-				}
-
-		if (!kmsg_log)
-			return;
-	}
-
-	log = kmsg_log;
-	iov[0].iov_base = (unsigned char *)&log_level;
-	iov[0].iov_len  = 1;
-
-	iov[1].iov_base = (void *)KERNEL_DOMAIN;
-	iov[1].iov_len  = strlen(KERNEL_DOMAIN) + 1;
-
-	iov[2].iov_base = (void *)log_msg;
-	iov[2].iov_len  = len;
-
-	while (count-- > 0) {
-		total_len += iov[count].iov_len;
-	}
-
-	now = current_kernel_time();
-
-	header.pid = current->tgid;
-	header.tid = current->pid;
-	header.sec = now.tv_sec;
-	header.nsec = now.tv_nsec;
-	header.len = min_t(size_t, total_len, LOGGER_ENTRY_MAX_PAYLOAD);
-
-	/* null writes succeed, return zero */
-	if (unlikely(!header.len))
-		return;
-#ifdef CONFIG_AMAZON_KLOG_CONSOLE_DEBUG
-	kmsg_total_count++;
-#endif
-
-	/*
-	 * We need to lock log->sem here, however, we can not call
-	 * down(&log->sem) directly, due to the following
-	 * function call sequence in console_unlock():
-	 *
-	 * -> raw_spin_lock_irqsave(&logbuf_lock, flags)
-	 * ...
-	 * -> raw_spin_unlock(&logbuf_lock)
-	 * ...
-	 * -> call_console_drivers()
-	 *    -> klog_console_write()
-	 *       -> logger_kmsg_write()
-	 * ...
-	 * -> local_irq_restore(flags)
-	 *
-	 * So if we call down(&log->sem) directly, might_sleep()
-	 * in down() will raise in_atomic() warnings, instead, we
-	 * call down_trylock() to avoid that, and if we fail locking it,
-	 * we write it to a ring buffer. We count
-	 * on the next call to logger_kmsg_write() would succeed on this
-	 * down_trylock() call, then we call logger_kmsg_drain_delayed()
-	 * to actually drain messages in the ring buffer.
-	 */
-	if (down_trylock(&log->sem)) {
-		int ret = logger_kmsg_drain(&header, log_msg, len);
-
-#ifdef CONFIG_AMAZON_KLOG_CONSOLE_DEBUG
-		if (!ret) {
-			kmsg_failed_count++;
-		} else {
-			kmsg_delayed_count++;
-		}
-#endif
-		return;
-	}
-
-	/* drain the delayed messages (with log->sem locked) */
-	logger_kmsg_drain_delayed(log);
-
-	/*
-	 * Fix up any readers, pulling them forward to the first readable
-	 * entry after (what will be) the new write offset. We do this now
-	 * because if we partially fail, we can end up with clobbered log
-	 * entries that encroach on readable buffer.
-	 */
-	fix_up_readers(log, sizeof(struct logger_entry) + header.len);
-
-	do_write_log(log, &header, sizeof(struct logger_entry));
-
-	total_len = 0;
-
-	count = 3;
-	while (count-- > 0) {
-		size_t len;
-
-		/* figure out how much of this vector we can keep */
-		len = min_t(size_t, piov->iov_len, header.len - total_len);
-
-		/* write out this segment's payload */
-		do_write_log(log, piov->iov_base, len);
-
-		piov++;
-		total_len += len;
-	}
-
-	logger_unlock(log);
-
-	__get_cpu_var(priv_data).log = log;
-	irq_work_queue(&(__get_cpu_var(priv_data).kmsg_write_work));
-}
-#endif
-
 static int __init logger_init(void)
 {
 	int ret;
 
-#ifndef CONFIG_AMAZON_LOGD
-	ret = create_log(LOGGER_LOG_MAIN, __MAIN_BUF_SIZE);
+	ret = create_log(LOGGER_LOG_MAIN, 256*1024);
 	if (unlikely(ret))
 		goto out;
 
-	ret = create_log(LOGGER_LOG_EVENTS, __EVENTS_BUF_SIZE);
+	ret = create_log(LOGGER_LOG_EVENTS, 256*1024);
 	if (unlikely(ret))
 		goto out;
 
-	ret = create_log(LOGGER_LOG_RADIO, __RADIO_BUF_SIZE);
+	ret = create_log(LOGGER_LOG_RADIO, 256*1024);
 	if (unlikely(ret))
 		goto out;
 
-	ret = create_log(LOGGER_LOG_SYSTEM, __SYSTEM_BUF_SIZE);
+	ret = create_log(LOGGER_LOG_SYSTEM, 256*1024);
 	if (unlikely(ret))
 		goto out;
-#endif /* CONFIG_AMAZON_LOGD */
-
-#ifdef CONFIG_AMAZON_KLOG_CONSOLE
-	ret = create_log(LOGGER_LOG_KERNEL, __KERNEL_BUF_SIZE);
-	if (unlikely(ret))
-		goto out;
-#ifdef CONFIG_AMAZON_KLOG_CONSOLE_DEBUG
-	ret = sysfs_create_group(kernel_kobj, &kmsg_attr_group);
-	if (ret)
-		goto out;
-#endif
-#endif
-
-#ifdef CONFIG_AMAZON_METRICS_LOG
-	ret = create_log(LOGGER_LOG_METRICS, __METRICS_BUF_SIZE);
-	if (unlikely(ret))
-		goto out;
-
-	metrics_init = 1;
-#endif
-
-#ifdef CONFIG_AMAZON_LOG
-#ifndef CONFIG_AMAZON_LOGD
-    ret = create_log(LOGGER_LOG_AMAZON_MAIN, 256*1024);
-    if (unlikely(ret))
-        goto out;
-#endif /* CONFIG_AMAZON_LOGD */
-
-	ret = create_log(LOGGER_LOG_AMAZON_VITALS, __VITALS_BUF_SIZE);
-	if (unlikely(ret))
-		goto out;
-#endif
 out:
 	return ret;
 }

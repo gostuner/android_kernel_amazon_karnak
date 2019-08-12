@@ -81,14 +81,6 @@ static int trip_step_wise_throttle(struct thermal_zone_device *tz, int trip)
 		mutex_unlock(&cdev->lock);
 
 		if (cur_state != target) {
-#ifdef CONFIG_AMAZON_METRICS_LOG
-			char buf[METRICS_STR_LEN];
-			snprintf(buf, METRICS_STR_LEN,
-				"%s:cooler_%s_throttling,cur_temp=%d;"
-				"trip_temp=%ld;target=%lu;CT;1:NR",
-				PREFIX, cdev->type, tz->temperature, trip_temp, target);
-			log_to_metrics(ANDROID_LOG_INFO, "ThermalEvent", buf);
-#endif
 
 			thermal_cdev_update(cdev);
 		}
